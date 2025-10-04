@@ -128,10 +128,12 @@ pad_pitch = 250000
 metal_width = 20000
 metal_width_laser = 50000
 metal_width_laser_heater = 20000
-laser_heater_distance = 100e3
+laser_heater_distance = 500e3
 wg_heater_length = 500
 student_laser_in_y = 250e3
 laser_pad_distance = 400e3
+ground_wire_width = 20e3  # on the edge of the chip
+trench_bondpad_offset = 20e3
 
 # configuration
 top_cell_name = 'Shuksan_2025_10_SiN'
@@ -144,7 +146,7 @@ cells_columns_per_laser = 4
 height_PCM = 1.5e6  # reserve this space at the bottom of the chip
 laser_dy = (die_size-height_PCM) / (n_lasers) # spread out evenly
 laser_y = -die_size/2 + height_PCM  + 1250e3
-laser_x = -die_edge  + 1.5e6
+laser_x = -die_edge  # Align laser left edge with die left edge
 laser_design_offset = 3e6 # distance from the laser to the student design
 chip_Width = 8650000
 chip_Height1 = 8490000
@@ -526,7 +528,7 @@ if tech == "EBeam":
     #cell_gcA = ly.create_cell('GC_Air_te1310_BB', library)
     #cell_gcB = ly.create_cell('GC_Air_te1310_BB', library)
     cell_terminator = create_cell2(ly, 'ebeam_terminator_SiN_1310', library)
-    cell_laser = create_cell2(ly, 'ebeam_dream_Laser_SiN_1310_BB', library_dream)
+    cell_laser = create_cell2(ly, 'ebeam_dream_Laser_SiN_1310_Bond_BB', library_dream)
     metal_layer = "M2_router"
     #cell_taper = ly.create_cell('ebeam_taper_350nm_2000nm_te1310', library_beta)
 
@@ -578,7 +580,9 @@ for row in range(0, n_lasers):
     laser_circuit_cells.append(laser_circuit_cell)
     
     # laser, place at absolute position in the laser circuit sub-cell
-    t = pya.Trans.from_s('r0 %s,%s' % (int(laser_x), int(laser_y)) )
+    # Align laser left edge with die left edge
+    laser_x_aligned = laser_x - cell_laser.bbox().left
+    t = pya.Trans.from_s('r0 %s,%s' % (int(laser_x_aligned), int(laser_y)) )
     inst_laser = laser_circuit_cell.insert(pya.CellInstArray(cell_laser.cell_index(), t))
     
     # heater, attach to the laser, then move it slight away from the laser
@@ -586,29 +590,60 @@ for row in range(0, n_lasers):
     inst_heater.transform(pya.Trans(laser_heater_distance, 0))
     connect_pins_with_waveguide(inst_laser, 'opt1', inst_heater, 'opt1', waveguide_type=waveguide_type, turtle_A=[radius_um,90]) #turtle_B=[10,-90, 100, 90])
 
-    # Bond pad for phase shifter heater
-    t = pya.Trans.from_s('r0 %s,%s' % (int(laser_x), inst_laser.bbox().top + laser_pad_distance+ cell_pad.bbox().height()) )
+    # Bond pad parameters
+    pad_pitch = 150e3
+    laser_pad_distance = 200e3
+    metal_width = 20e3
+    
+    # Calculate bond pad positions aligned to left edge
+    bondpads_x_offset = inst_laser.bbox().left + cell_pad.bbox().width()/2 + ground_wire_width + trench_bondpad_offset
+    bondpads_y = inst_laser.bbox().top + laser_pad_distance + cell_pad.bbox().height()/2
+    
+    # Bond pad for the laser top contact, and route to the left edge
+    x_laser_top_contact = -380e3  # Position relative to laser cell right edge
+    t = pya.Trans(inst_laser.trans.disp.x + x_laser_top_contact, bondpads_y)
+    inst_padL1 = laser_circuit_cell.insert(pya.CellInstArray(cell_pad.cell_index(), t))
+    t = pya.Trans(bondpads_x_offset, bondpads_y)
+    inst_padL2 = laser_circuit_cell.insert(pya.CellInstArray(cell_pad.cell_index(), t))
+    
+    # Metal routing to connect the two laser bond pads
+    pts = [
+        inst_padL1.find_pin('m_pin_left').center,
+        inst_padL2.find_pin('m_pin_right').center,
+    ]
+    path = pya.Path(pts, metal_width)
+    laser_circuit_cell.shapes(ly.layer(ly.TECHNOLOGY['M2_router'])).insert(path)
+    
+    # Bond pads for the heater (moved to left edge)
+    # Place first heater bond pad
+    bondpads_y += pad_pitch
+    t = pya.Trans(bondpads_x_offset, bondpads_y)
     inst_pad1 = laser_circuit_cell.insert(pya.CellInstArray(cell_pad.cell_index(), t))
-    t = pya.Trans.from_s('r0 %s,%s' % (int(laser_x), inst_laser.bbox().top + laser_pad_distance+ cell_pad.bbox().height() + pad_pitch) )
+    
+    # Place second heater bond pad
+    bondpads_y += pad_pitch
+    t = pya.Trans(bondpads_x_offset, bondpads_y)
     inst_pad2 = laser_circuit_cell.insert(pya.CellInstArray(cell_pad.cell_index(), t))
     
-    # Metal routing
+    # Metal routing from pad1 to heater elec1
     pts = [
         inst_pad1.find_pin('m_pin_right').center,
-        [inst_heater.find_pin('elec1').center.x,
-        inst_pad1.find_pin('m_pin_right').center.y],
+        pya.Point(inst_heater.find_pin('elec1').center.x,
+                  inst_pad1.find_pin('m_pin_right').center.y),
         inst_heater.find_pin('elec1').center
-        ]
-    path = pya.Path(pts, 20e3)
-    s = laser_circuit_cell.shapes(ly.layer(ly.TECHNOLOGY['M2_router'])).insert(path)
+    ]
+    path = pya.Path(pts, metal_width)
+    laser_circuit_cell.shapes(ly.layer(ly.TECHNOLOGY['M2_router'])).insert(path)
+    
+    # Metal routing from pad2 to heater elec2
     pts = [
         inst_pad2.find_pin('m_pin_right').center,
-        [inst_heater.find_pin('elec2').center.x,
-        inst_pad2.find_pin('m_pin_right').center.y],
+        pya.Point(inst_heater.find_pin('elec2').center.x,
+                  inst_pad2.find_pin('m_pin_right').center.y),
         inst_heater.find_pin('elec2').center
-        ]
-    path = pya.Path(pts, 20e3)
-    s = laser_circuit_cell.shapes(ly.layer(ly.TECHNOLOGY['M2_router'])).insert(path)
+    ]
+    path = pya.Path(pts, metal_width)
+    laser_circuit_cell.shapes(ly.layer(ly.TECHNOLOGY['M2_router'])).insert(path)
         
     
     # splitter tree
@@ -674,10 +709,44 @@ for row in range(0, n_lasers):
 
     laser_y += laser_dy
 
+def ground_wire(topcell):
+    '''
+    Create separate ground wires between each pair of lasers, using the deep trench layer
+    '''
+    ly = topcell.layout()
+    layer = ly.layer(ly.TECHNOLOGY['Deep Trench'])
+    components = topcell.find_components(verbose=False)
+    
+    # Collect laser positions
+    laser_positions = []
+    for c in components:
+        if c.component == "ebeam_dream_Laser_SiN_1310_Bond_BB":
+            bbox = c.cell.bbox().transformed(c.trans)
+            laser_positions.append((bbox.top, bbox.bottom))
+    
+    # Sort lasers by position (top to bottom)
+    laser_positions.sort(key=lambda x: x[0], reverse=True)  # Sort by top position, highest first
+    
+    print(f"Found {len(laser_positions)} lasers at positions: {laser_positions}")
+    
+    # Create separate wires between each pair of lasers
+    for i in range(len(laser_positions) - 1):
+        # Wire from bottom of current laser to top of next laser
+        current_laser_bottom = laser_positions[i][1]    # Bottom of current laser
+        next_laser_top = laser_positions[i+1][0]        # Top of next laser
+        
+        wire = pya.Path([pya.Point(-die_edge + ground_wire_width/2, current_laser_bottom), 
+                         pya.Point(-die_edge + ground_wire_width/2, next_laser_top)], ground_wire_width)
+        topcell.shapes(layer).insert(wire)
+        print(f"Created ground wire {i+1}: from laser {i+1} bottom ({current_laser_bottom}) to laser {i+2} top ({next_laser_top})")
+
 # Insert all laser circuit cells into the top cell
 for i, laser_circuit_cell in enumerate(laser_circuit_cells):
     t = Trans(Trans.R0, 0, 0)
     top_cell.insert(CellInstArray(laser_circuit_cell.cell_index(), t))
+
+# Add ground wire between the lasers
+ground_wire(top_cell)
 
   
 
