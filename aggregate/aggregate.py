@@ -130,8 +130,55 @@ metal_width_laser = 50000
 metal_width_laser_heater = 20000
 laser_heater_distance = 500e3
 wg_heater_length = 500
+# Default port position - will be dynamically determined for each design
 student_laser_in_y = 250e3
 laser_pad_distance = 400e3
+
+def find_port_sin_cell_and_position(cell, log_func=None, visited_cells=None):
+    """
+    Find the first port_SiN instance in a cell and return both the cell and its y-coordinate.
+    Searches recursively through all levels of the cell hierarchy.
+    
+    Args:
+        cell: The cell to search for port_SiN instances
+        log_func: Optional logging function
+        visited_cells: Set to track visited cells and prevent infinite recursion
+        
+    Returns:
+        tuple: (port_cell, y_position) or (None, None) if not found
+    """
+    if visited_cells is None:
+        visited_cells = set()
+    
+    # Prevent infinite recursion by tracking visited cells
+    if cell.cell_index() in visited_cells:
+        return None, None
+    visited_cells.add(cell.cell_index())
+    
+    if log_func:
+        log_func(f"Searching for port_SiN instances in cell: {cell.name}")
+    
+    # Search through all direct cell instances
+    for inst in cell.each_inst():
+        # Check if the cell name contains "port_SiN"
+        if "port_SiN" in inst.cell.name:
+            # Get the transformed bounding box to find the y position
+            bbox = inst.bbox()
+            y_position = bbox.center().y
+            if log_func:
+                log_func(f"Found port_SiN instance '{inst.cell.name}' at y={y_position}")
+            return inst.cell, y_position
+    
+    # If no port_SiN found in direct instances, recursively search in sub-cells
+    for inst in cell.each_inst():
+        # Recursively search in the sub-cell
+        port_cell, y_position = find_port_sin_cell_and_position(inst.cell, log_func, visited_cells)
+        if port_cell is not None:
+            return port_cell, y_position
+    
+    if log_func:
+        log_func(f"No port_SiN instances found in cell: {cell.name}")
+    return None, None
 ground_wire_width = 20e3  # on the edge of the chip
 trench_bondpad_offset = 20e3
 
@@ -320,6 +367,7 @@ design_count = 0
 subcell_instances = []
 course_cells = []  # list of each of the student designs
 cells_course = []  # into which course cell the design should go into
+student_port_positions = []  # list of port y-positions for each student design
 import subprocess
 import pandas as pd
 for f in [f for f in files_in if '.oas' in f.lower() or '.gds' in f.lower()]:
@@ -466,9 +514,32 @@ for f in [f for f in files_in if '.oas' in f.lower() or '.gds' in f.lower()]:
             
             log('  - Placed at position: %s, %s' % (x,y) )
             
-            # add a pin so we can connect a waveguide from the laser tree  
-            from SiEPIC.utils.layout import make_pin
-            make_pin(subcell2, 'opt_laser', [0, int(student_laser_in_y)], wg_width, 'PinRec', 180, debug=False)
+            # Find the actual port cell and position in the student design
+            port_cell, port_y = find_port_sin_cell_and_position(subcell, log_func=log)
+            if port_cell is not None and port_y is not None:
+                # Use the actual port position relative to the cell origin
+                actual_port_y = int(port_y - bbox.bottom)  # Adjust for cell origin
+                log(f"  - Using dynamic port position: y={actual_port_y}")
+                
+                # Add pin directly to the port cell
+                from SiEPIC.utils.layout import make_pin
+                # Calculate pin position relative to the port cell's origin
+                port_bbox = port_cell.bbox()
+                pin_x = int(port_bbox.left - port_bbox.left)  # Left edge of the cell (x=0)
+                pin_y = int(0)  # Middle vertically (y=0)
+                make_pin(port_cell, 'opt_laser', [pin_x, pin_y], wg_width, 'PinRec', 180, debug=False)
+                log(f"  - Added pin to port cell '{port_cell.name}' at left edge, middle vertically [{pin_x}, {pin_y}]")
+            else:
+                # Fall back to default position in the subcell2
+                actual_port_y = int(student_laser_in_y)
+                log(f"  - No port_SiN found, using default position: y={actual_port_y}")
+                
+                # add a pin so we can connect a waveguide from the laser tree  
+                from SiEPIC.utils.layout import make_pin
+                make_pin(subcell2, 'opt_laser', [0, actual_port_y], wg_width, 'PinRec', 180, debug=False)
+            
+            # Store the port position for later use in waveguide connections
+            student_port_positions.append(actual_port_y)
                           
             design_count += 1
             cells_course.append (cell_course)
@@ -492,12 +563,14 @@ for i, cell in enumerate(course_cells):
 if power_monitor_index is not None:
     # Move power monitor to position 0
     power_monitor_cell = course_cells.pop(power_monitor_index)
+    power_monitor_port_pos = student_port_positions.pop(power_monitor_index)
     #course_cells.insert(0, power_monitor_cell)
     log("Popped power monitor cell")
     
     # Create copies of power monitor for each laser circuit
     for row in range(n_lasers):
         course_cells.insert(row * tree_depth**2, power_monitor_cell)
+        student_port_positions.insert(row * tree_depth**2, power_monitor_port_pos)
         log("Created power monitor copy for laser circuit %d at position %d" % (row, row * tree_depth**2))
 else:
     log("WARNING: No power monitor cell found in course_cells")
@@ -680,13 +753,16 @@ for row in range(0, n_lasers):
         position_x = cell_column * (radius + cell_Width + waveguide_pitch/dbu * cells_rows_per_laser)
         t = Trans(Trans.R0, position_x0 + position_x, position_y0 + position_y)
         inst_student = laser_circuit_cell.insert(CellInstArray(course_cells[d].cell_index(), t))    
+        # Get the dynamic port position for this student design
+        dynamic_port_y = student_port_positions[d] if d < len(student_port_positions) else student_laser_in_y
+        
         connect_pins_with_waveguide(
             inst_tree_out_all[int(d/2)], 'opt%s'%(2+(d+1)%2), 
             inst_student, 'opt_laser', 
             waveguide_type=waveguide_type_routing, 
             turtle_B = [ # from the student
                 (cells_rows_per_laser-cell_row-1)*waveguide_pitch+radius_um,-90, # left away from student design
-                student_laser_in_y*ly.dbu+(cells_rows_per_laser-cell_row-1)*(cell_Height + cell_Gap_Height)*dbu + (cell_row + cell_column*cells_rows_per_laser)*waveguide_pitch,90, # up the column to the top
+                (500-dynamic_port_y*ly.dbu)+(cells_rows_per_laser-cell_row-1)*(cell_Height + cell_Gap_Height)*dbu + (cell_row + cell_column*cells_rows_per_laser)*waveguide_pitch,90, # up the column to the top
                 100,90, # left towards the laser
             ],
             turtle_A = [ # from the laser
